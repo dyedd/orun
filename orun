@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import os
+import subprocess
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+# 版本信息
+VERSION = "1.0.0"
+
+# 全局配置
+BASE_DIR = Path("/tmp/orun")
+BASE_DIR.mkdir(exist_ok=True, mode=0o777, parents=True)
+
+
+class GPUManager:
+    @staticmethod
+    def _check_nvidia_smi():
+        """检查nvidia-smi是否可用"""
+        try:
+            subprocess.run(
+                ["nvidia-smi", "--version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=True,
+            )
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return False
+
+    @classmethod
+    def get_gpu_status(cls):
+        """获取GPU状态信息"""
+        if not cls._check_nvidia_smi():
+            return []
+        try:
+            output_gpu = (
+                subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,utilization.gpu,memory.used,memory.total,gpu_bus_id",
+                        "--format=csv,noheader,nounits",
+                    ]
+                )
+                .decode()
+                .strip()
+            )
+            gpu_lines = output_gpu.split("\n")
+
+            output_process = (
+                subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-compute-apps=pid,gpu_bus_id",
+                        "--format=csv,noheader,nounits",
+                    ]
+                )
+                .decode()
+                .strip()
+            )
+            process_lines = output_process.split("\n")
+
+            bus_id_to_pids = {}
+            for line in process_lines:
+                parts = [p.strip() for p in line.split(",")]
+                pid, bus_id = int(parts[0]), parts[1]
+                if bus_id not in bus_id_to_pids:
+                    bus_id_to_pids[bus_id] = []
+                bus_id_to_pids[bus_id].append(pid)
+
+            gpus = []
+            for line in gpu_lines:
+                parts = [p.strip() for p in line.split(",")]
+                index, utilization, mem_used, mem_total, bus_id = parts
+                processes = bus_id_to_pids.get(bus_id, 0)
+                gpus.append(
+                    {
+                        "index": int(index),
+                        "utilization": int(utilization),
+                        "mem_used": int(mem_used),  # MB
+                        "mem_total": int(mem_total),
+                        "processes": processes,
+                    }
+                )
+
+            return gpus
+        except Exception as e:
+            print(f"GPU状态获取失败: {e}")
+            return []
+
+    @staticmethod
+    def acquire_gpu_lock(gpu_indices):
+        """获取GPU锁"""
+        try:
+            for gpu_idx in gpu_indices:
+                lock_file = BASE_DIR / f"gpu_{gpu_idx}.lock"
+                with open(lock_file, "w") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    f.write(f"Locked by {os.getpid()} at {time.time()}")
+                    f.flush()
+            return True
+        except BlockingIOError:
+            return False
+
+    @staticmethod
+    def release_gpu_lock(gpu_indices):
+        """释放GPU锁"""
+        try:
+            for gpu_idx in gpu_indices:
+                lock_file = BASE_DIR / f"gpu_{gpu_idx}.lock"
+                if lock_file.exists():
+                    os.remove(lock_file)
+            return True
+        except Exception as e:
+            print(f"释放GPU锁失败: {e}")
+            return False
+
+
+class Task:
+    def __init__(self, task_id, cmd, gpus, user):
+        self.id = task_id
+        self.cmd = cmd
+        self.gpus = gpus
+        self.user = user
+        self.status = "QUEUED"
+        self.pid = None
+        self.exit_code = None
+        self.proc = None
+
+
+class TaskScheduler:
+    def __init__(self):
+        self.task_queue = deque()
+        self.running = {}
+        self.lock = threading.Lock()
+        self.task_id = 0
+        self.activate = True
+
+        self.thread = threading.Thread(target=self.schedule_loop)
+        self.thread.start()
+
+    def schedule_loop(self):
+        while self.activate:
+            with self.lock:
+                completed_pids = []
+                for pid, task in list(self.running.items()):
+                    if task.proc.poll() is not None:
+                        self.handle_completion(task, task.proc)
+                        completed_pids.append(pid)
+                for pid in completed_pids:
+                    del self.running[pid]
+
+                available_gpus = self.get_available_gpus()
+
+                while (
+                    self.task_queue and len(available_gpus) >= self.task_queue[0].gpus
+                ):
+                    task = self.task_queue.popleft()
+                    allocated = available_gpus[: task.gpus]
+                    available_gpus = available_gpus[task.gpus :]
+                    self.start_task(task, allocated)
+
+                if not self.task_queue and not self.running:
+                    self.activate = False
+
+            time.sleep(3)
+
+    def get_available_gpus(self):
+        """获取当前可用的GPU索引"""
+        available = []
+        for gpu_idx in range(len(GPUManager.get_gpu_status())):
+            lock_file = BASE_DIR / f"gpu_{gpu_idx}.lock"
+            if not lock_file.exists():
+                available.append(gpu_idx)
+        return available
+
+    def start_task(self, task, gpus):
+        try:
+            if not GPUManager.acquire_gpu_lock(gpus):
+                print(f"无法获取GPU锁: {gpus}")
+                return
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+
+            proc = subprocess.Popen(
+                task.cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+            )
+            task.proc = proc
+            task.pid = proc.pid
+            task.status = "RUNNING"
+            self.running[proc.pid] = task
+
+        except Exception as e:
+            print(f"任务启动失败: {e}")
+            GPUManager.release_gpu_lock(gpus)
+
+    def handle_completion(self, task, proc):
+        task.exit_code = proc.poll()
+        task.status = "COMPLETED" if task.exit_code == 0 else "FAILED"
+
+        with self.lock:
+            if proc.pid in self.running:
+                del self.running[proc.pid]
+
+        GPUManager.release_gpu_lock(task.gpus)
+
+    def list_queued_tasks(self):
+        with self.lock:
+            return list(self.task_queue)
+
+    def delete_task(self, task_id):
+        with self.lock:
+            for i, task in enumerate(self.task_queue):
+                if task.id == task_id:
+                    self.task_queue.remove(task)
+                    return True
+            return False
+
+
+def run_client(args, scheduler):
+    try:
+        if args.status:
+            available_gpus = TaskScheduler().get_available_gpus()
+            print(
+                f"可用GPU数量: {len(available_gpus)} / 总GPU数量: {len(GPUManager.get_gpu_status())}"
+            )
+            print(
+                f"运行中的任务数量: {len(scheduler.running)} / 排队数量: {len(scheduler.task_queue)}"
+            )
+            return
+
+        if args.list:
+            tasks = scheduler.list_queued_tasks()
+            if not tasks:
+                print("当前队列中没有等待的任务")
+                return
+
+            print("队列中的任务:")
+            print(
+                "{:<5} {:<10} {:<30} {:<10}".format("ID", "用户", "命令", "需要GPU数")
+            )
+            print("-" * 60)
+            for task in tasks:
+                cmd_display = (
+                    (task.cmd[:27] + "...") if len(task.cmd) > 30 else task.cmd
+                )
+                print(
+                    "{:<5} {:<10} {:<30} {:<10}".format(
+                        task.id, task.user, cmd_display, task.gpus
+                    )
+                )
+            return
+
+        if args.delete:
+            task_id = int(args.delete)
+            if scheduler.delete_task(task_id):
+                print(f"任务 {task_id} 已从队列中删除")
+            else:
+                print(f"任务 {task_id} 不在队列中或已开始执行")
+            return
+
+        if not args.command:
+            return
+
+        with scheduler.lock:
+            scheduler.task_id += 1
+            task_id = scheduler.task_id
+            task = Task(
+                task_id=task_id,
+                cmd=" ".join(args.command),
+                gpus=args.gpus,
+                user=os.getenv("USER"),
+            )
+            scheduler.task_queue.append(task)
+            print(f"任务 {task_id} 已加入队列，需要 {args.gpus} 个GPU")
+
+    except Exception as e:
+        print(f"错误: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="orun", add_help=False)
+    parser.add_argument("command", nargs="*", help="要执行的命令")
+    parser.add_argument("--gpus", type=int, default=1, help="需要的 GPU 数量")
+    parser.add_argument("--status", action="store_true", help="显示系统状态")
+    parser.add_argument("--version", action="store_true", help="显示版本信息")
+    parser.add_argument("-h", "--help", action="store_true", help="显示帮助")
+    parser.add_argument("-l", "--list", action="store_true", help="列出队列中的任务")
+    parser.add_argument("-d", "--delete", type=int, help="删除指定ID的任务")
+
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"Orun 版本: {VERSION}")
+        return
+
+    if args.help:
+        print("Orun - GPU 任务调度系统")
+        print(f"版本: {VERSION}")
+        print("使用说明:")
+        print("  运行任务: orun [参数] <命令>")
+        print("  示例:")
+        print("    orun python train.py                 # 提交任务")
+        print("    orun --status                        # 查看系统状态")
+        print("\n参数说明:")
+        print("  --gpus N       需要的GPU数量 (默认:1)")
+        print("  --status       显示当前状态")
+        print("  --version      显示版本信息")
+        print("  -l, --list     列出队列中的任务")
+        print("  -d, --delete N 删除指定ID的任务")
+        return
+
+    scheduler = TaskScheduler()
+    run_client(args, scheduler)
+
+    if args.command and args.command[0] != "--":
+        scheduler.thread.join()
+
+
+if __name__ == "__main__":
+    main()
