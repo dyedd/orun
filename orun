@@ -1,362 +1,219 @@
 #!/usr/bin/env python3
 import argparse
+import atexit
 import fcntl
-import logging
 import os
-import signal
 import subprocess
 import sys
-import threading
 import time
-from collections import deque
-from pathlib import Path
+from datetime import datetime
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
-
-VERSION = "1.0.1"
-BASE_DIR = Path("/tmp/orun")
-BASE_DIR.mkdir(exist_ok=True, mode=0o777, parents=True)
-LOCK_TIMEOUT = 5  # 锁超时时间（秒）
+VERSION = "1.0.2"
+LOCK_DIR = "/tmp/orun"
+g_lock_files = {}
 
 
-class GPUManager:
-    @staticmethod
-    def _check_nvidia_smi():
-        """检查 nvidia-smi 可用性"""
-        try:
-            subprocess.run(
-                ["nvidia-smi", "--version"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=2,
-                check=True,
+def log_message(message, is_error=False):
+    """带时间戳的日志记录函数"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prefix = "[orun]"
+    stream = sys.stderr if is_error else sys.stdout
+    print(f"{timestamp} {prefix} {message}", file=stream)
+
+
+def get_gpu_count():
+    """使用 nvidia-smi 获取系统中的GPU总数"""
+    try:
+        output = (
+            subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=count", "--format=csv,noheader,nounits"]
             )
-            return True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            logger.warning("未检测到 NVIDIA 驱动或 nvidia-smi 工具")
-            return False
+            .decode("utf-8")
+            .strip()
+        )
+        return int(output)
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        log_message(
+            "无法执行 'nvidia-smi' 或解析其输出。请确保NVIDIA驱动和工具已正确安装。",
+            is_error=True,
+        )
+        sys.exit(1)
 
-    @staticmethod
-    def get_gpu_status():
-        """获取 GPU 状态信息"""
-        if not GPUManager._check_nvidia_smi():
-            return []
 
-        def run_query(fields, query_type):
-            try:
-                output = (
-                    subprocess.check_output(
-                        [
-                            "nvidia-smi",
-                            f"--query-{query_type}={fields}",
-                            "--format=csv,noheader,nounits",
-                        ],
-                        timeout=5,
-                    )
-                    .decode()
-                    .strip()
+def release_locks():
+    """释放所有已获取的GPU锁"""
+    global g_lock_files
+    if not g_lock_files:
+        return
+    for gpu_id, f in g_lock_files.items():
+        try:
+            fcntl.flock(f, fcntl.LOCK_UN)
+            f.close()
+        except IOError:
+            pass
+    g_lock_files.clear()
+
+
+def acquire_gpus(num_required, specific_gpus=None):
+    """
+    循环尝试获取指定数量或指定ID的GPU卡。
+    这是一个阻塞操作，直到获取成功为止。
+    """
+    global g_lock_files
+
+    total_gpus = get_gpu_count()
+    if specific_gpus:
+        for gpu_id in specific_gpus:
+            if gpu_id >= total_gpus:
+                log_message(
+                    f"指定的GPU ID {gpu_id} 超出系统GPU总数 {total_gpus}。",
+                    is_error=True,
                 )
-                return output.split("\n") if output else []
-            except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
-                logger.error(f"nvidia-smi 查询失败: {e}")
-                return []
+                sys.exit(1)
 
-        try:
-            gpu_fields = "index,utilization.gpu,memory.used,memory.total,gpu_bus_id"
-            process_fields = "pid,gpu_bus_id"
-            gpu_data = run_query(gpu_fields, "gpu")
-            process_data = run_query(process_fields, "compute-apps")
-
-            bus_id_to_pids = {}
-            for line in process_data:
-                if line.strip():
-                    pid, bus_id = line.split(", ")
-                    bus_id_to_pids.setdefault(bus_id, []).append(int(pid))
-
-            gpus = []
-            for line in gpu_data:
-                if line.strip():
-                    parts = line.split(", ")
-                    if len(parts) == 5:
-                        gpu_info = {
-                            "index": int(parts[0]),
-                            "utilization": int(parts[1]),
-                            "mem_used": int(parts[2]),
-                            "mem_total": int(parts[3]),
-                            "gpu_bus_id": parts[4],
-                            "processes": bus_id_to_pids.get(parts[4], []),
-                        }
-                        gpus.append(gpu_info)
-            return gpus
-        except Exception as e:
-            logger.error(f"获取 GPU 状态异常: {e}")
-            return []
-
-    @staticmethod
-    def acquire_gpu_lock(gpu_indices, timeout=LOCK_TIMEOUT):
-        """原子性获取 GPU 锁"""
-        start_time = time.time()
-        acquired = []
-        for gpu_idx in gpu_indices:
-            lock_file = BASE_DIR / f"gpu_{gpu_idx}.lock"
-            while time.time() - start_time < timeout:
-                try:
-                    with open(lock_file, "w+") as f:
-                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        f.write(f"{os.getpid()} {time.time()}")
-                        f.flush()
-                        acquired.append(gpu_idx)
-                        break
-                except BlockingIOError:
-                    time.sleep(0.1)
-            else:
-                GPUManager.release_gpu_lock(acquired)
-                return False
-        return True
-
-    @staticmethod
-    def release_gpu_lock(gpu_indices):
-        """安全释放 GPU 锁"""
-        for gpu_idx in gpu_indices:
-            lock_file = BASE_DIR / f"gpu_{gpu_idx}.lock"
-            if lock_file.exists():
-                try:
-                    with open(lock_file, "r+") as f:
-                        fcntl.flock(f, fcntl.LOCK_EX)
-                        if f.read().strip().startswith(str(os.getpid())):
-                            f.truncate(0)
-                            fcntl.flock(f, fcntl.LOCK_UN)
-                            lock_file.unlink()
-                except Exception as e:
-                    logger.warning(f"释放 GPU {gpu_idx} 锁失败: {e}")
-
-
-class Task:
-    def __init__(self, task_id, cmd, gpus, user):
-        self.id = task_id
-        self.cmd = cmd
-        self.gpus = gpus
-        self.user = user
-        self.status = "QUEUED"
-        self.pid = None
-        self.proc = None
-        self.start_time = None
-        self.end_time = None
-        self.exit_code = None
-
-    def duration(self):
-        """计算任务运行时间"""
-        return (
-            self.end_time - self.start_time
-            if self.start_time and self.end_time
-            else None
+    while True:
+        candidate_gpus = (
+            specific_gpus if specific_gpus is not None else list(range(total_gpus))
         )
 
+        acquired_gpus = []
+        temp_lock_files = {}
 
-class TaskScheduler:
-    def __init__(self):
-        self.task_queue = deque()
-        self.running = {}
-        self.lock = threading.Lock()
-        self.task_id = 0
-        self.condition = threading.Condition(self.lock)
-        self.total_gpus = len(GPUManager.get_gpu_status())
-        self.shutdown_requested = False
-        self.thread = threading.Thread(target=self.schedule_loop, daemon=True)
-        self.thread.start()
-
-    def schedule_loop(self):
-        """任务调度主循环"""
-        while not self.shutdown_requested:
-            with self.lock:
-                # 处理已完成任务
-                for pid, task in list(self.running.items()):
-                    if task.proc.poll() is not None:
-                        task.end_time = time.time()
-                        task.exit_code = task.proc.returncode
-                        task.status = "COMPLETED" if task.exit_code == 0 else "FAILED"
-                        GPUManager.release_gpu_lock(task.gpus)
-                        del self.running[pid]
-                        logger.info(f"任务 {task.id} 完成，退出码: {task.exit_code}")
-
-                # 调度等待任务
-                available_gpus = self.get_available_gpus()
-                while (
-                    self.task_queue and len(available_gpus) >= self.task_queue[0].gpus
-                ):
-                    task = self.task_queue.popleft()
-                    if task.gpus > self.total_gpus:
-                        task.status = "FAILED"
-                        logger.error(
-                            f"任务 {task.id} 请求 GPU ({task.gpus}) 超过总量 ({self.total_gpus})"
-                        )
-                        continue
-                    allocated = available_gpus[: task.gpus]
-                    if GPUManager.acquire_gpu_lock(allocated):
-                        self.start_task(task, allocated)
-                        available_gpus = available_gpus[len(task.gpus) :]
-                    else:
-                        self.task_queue.appendleft(task)
-                        break
-
-                self.condition.wait(timeout=1 if self.task_queue else 5)
-
-    def get_available_gpus(self):
-        """获取可用 GPU 列表"""
-        return sorted(
-            gpu["index"]
-            for gpu in GPUManager.get_gpu_status()
-            if not (BASE_DIR / f"gpu_{gpu['index']}.lock").exists()
-        )
-
-    def start_task(self, task, gpus):
-        """启动任务"""
-        try:
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
-            task.start_time = time.time()
-            task.status = "RUNNING"
-            task.proc = subprocess.Popen(task.cmd, env=env, start_new_session=True)
-            task.pid = task.proc.pid
-            task.gpus = gpus
-            self.running[task.pid] = task
-            logger.info(f"任务 {task.id} 启动，PID: {task.pid}，GPU: {gpus}")
-        except Exception as e:
-            logger.error(f"任务 {task.id} 启动失败: {e}")
-            task.status = "FAILED"
-            GPUManager.release_gpu_lock(gpus)
-            self.task_queue.appendleft(task)
-
-    def list_queued_tasks(self):
-        """列出队列中的任务"""
-        with self.lock:
-            return list(self.task_queue)
-
-    def delete_task(self, task_id):
-        """删除指定任务"""
-        with self.lock:
-            for i, task in enumerate(self.task_queue):
-                if task.id == task_id:
-                    del self.task_queue[i]
-                    logger.info(f"任务 {task_id} 已删除")
-                    return True
-            return False
-
-    def shutdown(self):
-        """优雅关闭调度器"""
-        self.shutdown_requested = True
-        with self.lock:
-            self.condition.notify_all()
-
-        for task in list(self.running.values()):
+        for gpu_id in candidate_gpus:
+            lock_path = os.path.join(LOCK_DIR, f"gpu{gpu_id}.lock")
             try:
-                os.killpg(os.getpgid(task.pid), signal.SIGTERM)
-                task.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(task.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            finally:
-                GPUManager.release_gpu_lock(task.gpus)
-                if task.pid in self.running:
-                    del self.running[task.pid]
+                f = open(lock_path, "w")
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_gpus.append(gpu_id)
+                temp_lock_files[gpu_id] = f
+                if len(acquired_gpus) == num_required:
+                    break
+            except IOError:
+                f.close()
+                continue
 
-        self.thread.join(timeout=10)
-
-
-def run_client(args, scheduler):
-    """处理客户端请求"""
-    if args.version:
-        print(f"Orun 版本: {VERSION}")
-        return
-
-    if args.status:
-        gpus = GPUManager.get_gpu_status()
-        print(f"总 GPU 数: {len(gpus)}")
-        print(f"可用 GPU: {scheduler.get_available_gpus()}")
-        print(f"运行中任务: {len(scheduler.running)}")
-        print(f"排队任务: {len(scheduler.task_queue)}")
-        return
-
-    if args.list:
-        tasks = scheduler.list_queued_tasks()
-        if not tasks:
-            print("队列中无任务")
+        if len(acquired_gpus) == num_required:
+            g_lock_files = temp_lock_files
+            log_message(f"成功获取GPU: {acquired_gpus}")
+            return acquired_gpus
         else:
-            print("{:<5} {:<10} {:<30} {:<10}".format("ID", "用户", "命令", "GPU需求"))
-            print("-" * 60)
-            for task in tasks:
-                cmd = " ".join(task.cmd)[:30]
-                print(
-                    "{:<5} {:<10} {:<30} {:<10}".format(
-                        task.id, task.user, cmd, task.gpus
-                    )
-                )
-        return
-
-    if args.delete is not None:
-        print(
-            f"任务 {args.delete} {'已删除' if scheduler.delete_task(args.delete) else '不存在'}"
-        )
-        return
-
-    if args.command:
-        with scheduler.lock:
-            scheduler.task_id += 1
-            task = Task(
-                scheduler.task_id, args.command, args.gpus, os.getenv("USER", "unknown")
+            for f in temp_lock_files.values():
+                fcntl.flock(f, fcntl.LOCK_UN)
+                f.close()
+            log_message(
+                f"当前可用GPU不足 ({len(acquired_gpus)}/{num_required})，10秒后重试..."
             )
-            if task.gpus > scheduler.total_gpus:
-                logger.error(
-                    f"请求 GPU 数 ({task.gpus}) 超过总量 ({scheduler.total_gpus})"
-                )
-                return
-            scheduler.task_queue.append(task)
-            scheduler.condition.notify()
-            print(f"任务 {task.id} 已加入队列（需要 {task.gpus} 个 GPU）")
+            time.sleep(10)
 
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(prog="orun", description="GPU 任务调度系统")
-    parser.add_argument("command", nargs=argparse.REMAINDER, help="要执行的命令")
-    parser.add_argument("--gpus", type=int, default=1, help="需要的 GPU 数量")
-    parser.add_argument("--status", action="store_true", help="显示系统状态")
-    parser.add_argument("--version", action="store_true", help="显示版本信息")
-    parser.add_argument("--list", action="store_true", help="列出队列中的任务")
-    parser.add_argument("--delete", type=int, help="删除指定 ID 的任务")
+    parser = argparse.ArgumentParser(
+        description="Orun - 一个简单的GPU任务调度工具",
+        formatter_class=argparse.RawTextHelpFormatter,
+        usage="orun [options] -- your_command [args...]",
+    )
+    parser.add_argument("--version", action="version", version=f"orun {VERSION}")
+    parser.add_argument(
+        "-n", "--num-gpus", type=int, default=1, help="需要占用的GPU卡数量。默认为1。"
+    )
+    parser.add_argument(
+        "-g",
+        "--gpus",
+        type=str,
+        help='指定要使用的GPU卡ID，用逗号分隔，例如 "0,3"。如果设置此项，则忽略-n。',
+    )
+    parser.add_argument(
+        "-b",
+        "--background",
+        action="store_true",
+        help="后台运行任务，类似sbatch。会自动生成日志文件，并立即返回shell。",
+    )
+    parser.add_argument(
+        "command", nargs=argparse.REMAINDER, help="要执行的命令及其参数。"
+    )
+
     args = parser.parse_args()
 
-    if args.version:
-        print(f"Orun 版本: {VERSION}")
-        return
-    if not args.command and not any([args.status, args.list, args.delete]):
+    if not args.command:
         parser.print_help()
-        return
+        log_message("未提供要执行的命令。", is_error=True)
+        sys.exit(1)
 
-    scheduler = TaskScheduler()
+    if args.command[0] == "--":
+        args.command = args.command[1:]
+        if not args.command:
+            parser.print_help()
+            log_message("'--' 之后未提供要执行的命令。", is_error=True)
+            sys.exit(1)
 
-    def signal_handler(sig, frame):
-        scheduler.shutdown()
-        sys.exit(0)
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    atexit.register(release_locks)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    num_required = args.num_gpus
+    specific_gpus = None
+    if args.gpus:
+        try:
+            specific_gpus = [int(g) for g in args.gpus.split(",")]
+            num_required = len(specific_gpus)
+        except ValueError:
+            log_message(
+                f"无效的GPU ID格式 '{args.gpus}'。请使用逗号分隔的数字。", is_error=True
+            )
+            sys.exit(1)
 
-    try:
-        run_client(args, scheduler)
-        if args.command:
-            while not scheduler.shutdown_requested:
-                time.sleep(1)
-    finally:
-        if not scheduler.shutdown_requested:
-            scheduler.shutdown()
+    acquired_gpu_ids = acquire_gpus(num_required, specific_gpus)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, acquired_gpu_ids))
+
+    if args.background:
+        # 后台模式，创建守护进程
+        if os.fork() > 0:
+            sys.exit(0)
+        os.setsid()
+        if os.fork() > 0:
+            sys.exit(0)
+
+        # 孙子进程（守护进程）继续执行
+        job_pid = os.getpid()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = os.path.abspath(f"orun-job{job_pid}-{timestamp}.log")
+
+        # 在父进程退出前，先向原始终端打印关键信息
+        log_message(f"PID: {job_pid}, Log: {log_filename}")
+
+        # 重定向守护进程的输出到日志文件
+        sys.stdout.flush()
+        sys.stderr.flush()
+        with open(log_filename, "a") as log_file:
+            os.dup2(log_file.fileno(), sys.stdout.fileno())
+            os.dup2(log_file.fileno(), sys.stderr.fileno())
+
+        # 守护进程作为“监工”执行并等待命令完成
+        try:
+            proc = subprocess.Popen(args.command)
+            proc.wait()  # 等待命令结束
+        except Exception as e:
+            log_message(f"后台任务(PID:{job_pid})执行失败: {e}", is_error=True)
+        finally:
+            # 确保守护进程退出前释放锁 (atexit在这里可能不可靠)
+            release_locks()
+            sys.exit(0)
+    else:
+        # 前台模式
+        try:
+            subprocess.run(args.command, check=True)
+        except subprocess.CalledProcessError as e:
+            print("-" * 40, file=sys.stderr)
+            # 命令执行失败，返回非零退出码
+            sys.exit(e.returncode)
+        except KeyboardInterrupt:
+            # 用户通过Ctrl+C中断
+            print("\n" + "-" * 40)
+            log_message("任务被用户中断 (Ctrl+C)。")
+            sys.exit(1)
+        except FileNotFoundError:
+            log_message(f"命令 '{args.command[0]}' 未找到。", is_error=True)
+            sys.exit(127)
 
 
 if __name__ == "__main__":
