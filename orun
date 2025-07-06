@@ -189,14 +189,31 @@ def main():
             os.dup2(log_file.fileno(), sys.stderr.fileno())
 
         # 守护进程作为“监工”执行并等待命令完成
+        proc = None
         try:
             proc = subprocess.Popen(args.command)
-            proc.wait()  # 等待命令结束
+            return_code = proc.wait()  # 等待命令结束
+
+            if return_code != 0:
+                log_message(f"后台任务执行失败，返回码: {return_code}", is_error=True)
+                # 即使失败也继续进行到finally块释放资源
         except Exception as e:
-            log_message(f"后台任务(PID:{job_pid})执行失败: {e}", is_error=True)
+            log_message(f"后台任务(PID:{job_pid})执行异常: {e}", is_error=True)
         finally:
-            # 确保守护进程退出前释放锁 (atexit在这里可能不可靠)
+            # 确保即使子进程还在运行也尝试终止它
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()  # 尝试优雅地终止
+                    time.sleep(2)  # 给进程一点时间来清理
+                    if proc.poll() is None:
+                        log_message("子进程未能正常终止，强制结束中...", is_error=True)
+                        proc.kill()  # 如果还在运行，强制结束
+                except Exception as e:
+                    log_message(f"终止子进程失败: {e}", is_error=True)
+
+            # 确保守护进程退出前释放GPU锁
             release_locks()
+            log_message("GPU资源已释放")
             sys.exit(0)
     else:
         # 前台模式
